@@ -149,7 +149,9 @@ export PTPX_MAX_CORES="$PT_CORES"
 (
   cd "$RUN_DIR"
   set -o pipefail
-  pt_shell -f "$TCL_TEMPLATE" 2>&1 | tee ptpx.log
+  # Close stdin so a Tcl error cannot leave pt_shell waiting at an
+  # interactive prompt. Missing ptpx.done is checked below.
+  pt_shell -f "$TCL_TEMPLATE" </dev/null 2>&1 | tee ptpx.log
 )
 
 [[ -s "$RUN_DIR/ptpx.done" ]] || die "PTPX done marker missing"

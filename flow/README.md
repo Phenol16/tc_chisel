@@ -10,7 +10,7 @@ This flow follows the proven `encrypu` sequence:
 
 The behavioral A/B/C memories are outside `u_ToomCook1024`. PTPX uses
 `read_saif ... -strip_path Tb/u_ToomCook1024`, so external input/output memory
-power is excluded. The six internal RSPHVT macro types remain inside the DUT
+power is excluded. The three internal RSPHVT macro types remain inside the DUT
 and are included through their CCS DBs.
 
 ## VCS on the post-synthesis server

@@ -65,7 +65,7 @@ report_timing -slack_lesser_than 0.0 -pba_mode exhaustive \
   > $REPORTS_DIR/${DESIGN_NAME}.timing.pba.rpt
 report_constraints -verbose > $REPORTS_DIR/${DESIGN_NAME}.constraints.rpt
 
-read_saif -input $SAIF_FILE -strip_path $SAIF_STRIP_PATH
+read_saif $SAIF_FILE -strip_path $SAIF_STRIP_PATH
 report_switching_activity \
   > $REPORTS_DIR/${DESIGN_NAME}.switching.rpt
 report_switching_activity -list_not_annotated \

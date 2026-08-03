@@ -7,6 +7,7 @@ import core._
 private class RfSpMacro(width: Int, depth: Int) extends BlackBox {
   private val supported =
     (depth == 28 && (width == 160 || width == 144)) ||
+      (depth == 148 && width == 160) ||
       (depth == 196 &&
         (width == 160 || width == 144 || width == 132)) ||
       (depth == 112 && width == 144)

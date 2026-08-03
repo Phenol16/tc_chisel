@@ -44,7 +44,80 @@ class EvalPoint(inW: Int, outW: Int) extends Module {
     val out = Output(UInt(outW.W))
   })
 
-  val layer = Module(new Eval(inWidth = inW, outWidth = outW))
-  layer.io.in := io.r
-  io.out := MuxLookup(io.pt, 0.U(outW.W))((0 until 7).map(i => i.U -> layer.io.out(i))) //根据 io.pt 的值，从 layer.io.out(0..6) 中选择一个作为 io.out
+  private def resize(value: UInt): UInt = {
+    if (value.getWidth >= outW) value(outW - 1, 0)
+    else Cat(0.U((outW - value.getWidth).W), value)
+  }
+
+  private def shift(value: UInt, amount: Int): UInt =
+    ParaMath.mask(resize(value) << amount, outW)
+
+  /*
+   * Select the four signed power-of-two terms before the adder chain.  This
+   * implements exactly one requested Toom point instead of building all seven
+   * point datapaths and selecting one of their outputs.
+   */
+  val term0 = WireDefault(0.U(outW.W))
+  val term1 = WireDefault(0.U(outW.W))
+  val term2 = WireDefault(0.U(outW.W))
+  val term3 = WireDefault(0.U(outW.W))
+  val sub1 = WireDefault(false.B)
+  val sub3 = WireDefault(false.B)
+
+  switch(io.pt) {
+    is(0.U) {
+      term0 := resize(io.r(3))
+    }
+    is(1.U) {
+      term0 := resize(io.r(0))
+      term1 := shift(io.r(1), 1)
+      term2 := shift(io.r(2), 2)
+      term3 := shift(io.r(3), 3)
+    }
+    is(2.U) {
+      term0 := resize(io.r(0))
+      term1 := resize(io.r(1))
+      term2 := resize(io.r(2))
+      term3 := resize(io.r(3))
+    }
+    is(3.U) {
+      term0 := resize(io.r(0))
+      term1 := resize(io.r(1))
+      term2 := resize(io.r(2))
+      term3 := resize(io.r(3))
+      sub1 := true.B
+      sub3 := true.B
+    }
+    is(4.U) {
+      term0 := shift(io.r(0), 3)
+      term1 := shift(io.r(1), 2)
+      term2 := shift(io.r(2), 1)
+      term3 := resize(io.r(3))
+    }
+    is(5.U) {
+      term0 := shift(io.r(0), 3)
+      term1 := shift(io.r(1), 2)
+      term2 := shift(io.r(2), 1)
+      term3 := resize(io.r(3))
+      sub1 := true.B
+      sub3 := true.B
+    }
+    is(6.U) {
+      term0 := resize(io.r(0))
+    }
+  }
+
+  val sum01 = Wire(UInt(outW.W))
+  val sum012 = Wire(UInt(outW.W))
+  sum01 := Mux(
+    sub1,
+    ParaMath.mask(term0 -& term1, outW),
+    ParaMath.mask(term0 +& term1, outW)
+  )
+  sum012 := ParaMath.mask(sum01 +& term2, outW)
+  io.out := Mux(
+    sub3,
+    ParaMath.mask(sum012 -& term3, outW),
+    ParaMath.mask(sum012 +& term3, outW)
+  )
 }

@@ -41,23 +41,24 @@ class ToomCook1024ExternalIO extends Bundle {
     Vec(4, Flipped(new ToomCookParalBufferWrIO(24, 4, 16)))
 }
 
-class ToomCook1024CoreIO(evalPairWidth: Int) extends Bundle {
+class ToomCook1024CoreIO(e1BasePairWidth: Int) extends Bundle {
   val inf = new ToomCook1024ExternalIO
 
-  // E0 is reused once per outer group.
-  val e0Scratch =
-    Flipped(new ToomCookSpBufferRWIO(evalPairWidth, 5))
-
-  // Eval->Core stores E1, not the final E2 values.
+  // Eval->Core stores the fixed low E1 bits in the base memory.  Rows whose
+  // point pair needs more range also use one dense high-bit extension memory.
   val e1Store = Vec(
     2,
-    Flipped(new ToomCookSpBufferRWIO(evalPairWidth, 8))
+    Flipped(new ToomCookSpBufferRWIO(e1BasePairWidth, 8))
+  )
+  val e1ExtStore = Vec(
+    2,
+    Flipped(new ToomCookSpBufferRWIO(160, 8))
   )
 
   // Core->Inte stores the first interpolation result I0.
   val i0Store = Vec(
     2,
-    Flipped(new ToomCookSpBufferRWIO(16 * 33, 8))
+    Flipped(new ToomCookSpBufferRWIO(16 * InterpStorageWidth.I0_W, 8))
   )
 
   // I1->I2 is private to the interpolation stage.
@@ -103,14 +104,35 @@ class ToomCook1024Core(
 
   private val A_EVAL_W = aEvalWidth
   private val B_EVAL_W = bEvalWidth
-  private val A_WORD_W = 16 * A_EVAL_W
-  private val B_WORD_W = 16 * B_EVAL_W
-  private val EVAL_PAIR_W = A_WORD_W + B_WORD_W
-  private val CORE_WORD_W = 16 * coreOutWidth
-  private val I0_WORD_W = 16 * 33
-  private val I1_WORD_W = 16 * 27
+  private val A_E0_W = EvalStorageWidth.A_E0_W
+  private val B_E0_W = EvalStorageWidth.B_E0_W
+  private val A_E1_W = EvalStorageWidth.A_E1_W
+  private val B_E1_W = EvalStorageWidth.B_E1_W
+  private val A_E2_W = EvalStorageWidth.A_E2_W
+  private val B_E2_W = EvalStorageWidth.B_E2_W
+  private val A_E0_WORD_W = 16 * A_E0_W
+  private val B_E0_WORD_W = 16 * B_E0_W
+  private val E0_PAIR_W = A_E0_WORD_W + B_E0_WORD_W
+  private val A_E1_WORD_W = 16 * A_E1_W
+  private val B_E1_WORD_W = 16 * B_E1_W
+  private val E1_PAIR_W = A_E1_WORD_W + B_E1_WORD_W
+  private val A_E1_BASE_W = 27
+  private val B_E1_BASE_W = 13
+  private val A_E1_BASE_WORD_W = 16 * A_E1_BASE_W
+  private val B_E1_BASE_WORD_W = 16 * B_E1_BASE_W
+  private val E1_BASE_PAIR_W = A_E1_BASE_WORD_W + B_E1_BASE_WORD_W
+  private val E1_EXT_LANE_W =
+    (A_E1_W - A_E1_BASE_W) + (B_E1_W - B_E1_BASE_W)
+  private val E1_EXT_WORD_W = 16 * E1_EXT_LANE_W
+  private val CORE_INTERP_W = InterpStorageWidth.CORE_INPUT_W
+  private val I0_W = InterpStorageWidth.I0_W
+  private val I1_W = InterpStorageWidth.I1_W
+  private val I2_W = InterpStorageWidth.I2_W
+  private val I0_WORD_W = 16 * I0_W
+  private val I1_WORD_W = 16 * I1_W
+  private val I2_WORD_W = 16 * I2_W
 
-  val io = IO(new ToomCook1024CoreIO(EVAL_PAIR_W))
+  val io = IO(new ToomCook1024CoreIO(E1_BASE_PAIR_W))
   val inf = io.inf
 
   private def packVec(xs: Seq[UInt]): UInt = Cat(xs.reverse)
@@ -138,10 +160,10 @@ class ToomCook1024Core(
     port.din := 0.U.asTypeOf(port.din)
   }
 
-  clearRamPort(io.e0Scratch)
   clearRamPort(io.i1Store)
   for (slot <- 0 until 2) {
     clearRamPort(io.e1Store(slot))
+    clearRamPort(io.e1ExtStore(slot))
     clearRamPort(io.i0Store(slot))
   }
 
@@ -179,198 +201,186 @@ class ToomCook1024Core(
   }
 
   // ------------------------------------------------------------------------
-  // Eval slot: E0/E1.  Seven parallel Eval outputs are drained one per cycle.
+  // Eval slot: E0/E1.  One selected point is evaluated and written per cycle.
   // ------------------------------------------------------------------------
   val sharedEvalA =
-    Seq.fill(16)(Module(new Eval(A_EVAL_W, A_EVAL_W)))
+    Seq.fill(16)(Module(new EvalPoint(A_E1_W, A_E1_W)))
   val sharedEvalB =
-    Seq.fill(16)(Module(new Eval(B_EVAL_W, B_EVAL_W)))
+    Seq.fill(16)(Module(new EvalPoint(B_E1_W, B_E1_W)))
 
-  val evalWindowA = Reg(Vec(3, UInt(A_WORD_W.W)))
-  val evalWindowB = Reg(Vec(3, UInt(B_WORD_W.W)))
-  val evalPending = Reg(Vec(7, UInt(EVAL_PAIR_W.W)))
+  /*
+   * One outer tile contains four input addresses and four physical banks.
+   * Raw input widths are kept here.  E0 is stored at its proven 29/13-bit
+   * signed bound and sign-extended to the E1 arithmetic widths before E1.
+   */
+  private val A_RAW_WORD_W = 16 * 24
+  private val B_RAW_WORD_W = 16 * 8
+  val evalRawA = Reg(Vec(4, Vec(4, UInt(A_RAW_WORD_W.W))))
+  val evalRawB = Reg(Vec(4, Vec(4, UInt(B_RAW_WORD_W.W))))
+  val evalMid = Reg(Vec(4, UInt(E0_PAIR_W.W)))
 
-  val Seq(
-    eIdle,
-    e0Issue,
-    e0Wait,
-    e0Write,
-    e1Prime,
-    e1PrimeWait,
-    e1Write
-  ) = Enum(7)
+  val Seq(eIdle, eLoad, eLoadWait, eEval0, eEval1) = Enum(5)
   val evalState = RegInit(eIdle)
 
   val evalOutSlot = RegInit(false.B)
   val evalOuter = RegInit(0.U(2.W))
-  val e0Inner = RegInit(0.U(2.W))
-  val e0WritePoint = RegInit(0.U(3.W))
-  val e1Pt0 = RegInit(0.U(3.W))
-  val e1PrimePart = RegInit(0.U(2.W))
-  val e1WritePoint = RegInit(0.U(3.W))
+  val evalLoadInner = RegInit(0.U(2.W))
+  val evalInner = RegInit(0.U(2.W))
+  val evalPt0 = RegInit(0.U(3.W))
+  val evalPt1 = RegInit(0.U(3.W))
+  val evalE1Addr = RegInit(0.U(8.W))
+  val evalE1ExtAddr = RegInit(0.U(8.W))
 
-  val e0ReadFire =
-    evalState === e0Issue ||
-      (evalState === e0Write &&
-        e0WritePoint === 5.U && e0Inner =/= 3.U)
-  val e0ReadValid = RegNext(e0ReadFire, false.B)
-  val e0ReadInnerD = RegEnable(
-    Mux(evalState === e0Issue, e0Inner, e0Inner + 1.U),
-    e0ReadFire
-  )
-  val e0ReadOuterD = RegEnable(evalOuter, e0ReadFire)
+  private def e1NeedsExtension(pt0: UInt, pt1: UInt): Bool = {
+    val pt0Wide = pt0 === 1.U || pt0 === 4.U || pt0 === 5.U
+    val pt1Wide = pt1 === 1.U || pt1 === 4.U || pt1 === 5.U
+    val pt0Four = pt0 === 2.U || pt0 === 3.U
+    val pt1Four = pt1 === 2.U || pt1 === 3.U
+    pt0Wide || pt1Wide || (pt0Four && pt1Four)
+  }
 
-  when(e0ReadFire) {
-    val readInner =
-      Mux(evalState === e0Issue, e0Inner, e0Inner + 1.U)
+  val evalReadFire = evalState === eLoad
+  val evalReadValid = RegNext(evalReadFire, false.B)
+  val evalReadInnerD = RegEnable(evalLoadInner, evalReadFire)
+  val evalReadOuterD = RegEnable(evalOuter, evalReadFire)
+
+  when(evalReadFire) {
     for (bank <- 0 until 4) {
       inf.aMem(bank).en := true.B
-      inf.aMem(bank).addr := Cat(evalOuter, readInner)
+      inf.aMem(bank).addr := Cat(evalOuter, evalLoadInner)
       inf.bMem(bank).en := true.B
-      inf.bMem(bank).addr := Cat(evalOuter, readInner)
+      inf.bMem(bank).addr := Cat(evalOuter, evalLoadInner)
     }
-    when(evalState === e0Issue) {
-      evalState := e0Wait
-    }
-  }
-
-  val e1ReadFire =
-    evalState === e1Prime ||
-      (evalState === e1Write &&
-        e1WritePoint >= 2.U && e1WritePoint <= 5.U &&
-        e1Pt0 =/= 6.U)
-  val e1ReadValid = RegNext(e1ReadFire, false.B)
-  val e1ReadPart = Wire(UInt(2.W))
-  val e1ReadPt0 = Wire(UInt(3.W))
-  e1ReadPart := e1PrimePart
-  e1ReadPt0 := e1Pt0
-  when(evalState === e1Write) {
-    e1ReadPart := e1WritePoint - 2.U
-    e1ReadPt0 := e1Pt0 + 1.U
-  }
-  val e1ReadPartD = RegEnable(e1ReadPart, e1ReadFire)
-  val e1ReadPt0D = RegEnable(e1ReadPt0, e1ReadFire)
-
-  when(e1ReadFire) {
-    io.e0Scratch.en := true.B
-    io.e0Scratch.addr := e1ReadPt0 * 4.U + e1ReadPart
-    when(evalState === e1Prime) {
-      when(e1PrimePart === 3.U) {
-        evalState := e1PrimeWait
-      }.otherwise {
-        e1PrimePart := e1PrimePart + 1.U
-      }
+    when(evalLoadInner === 3.U) {
+      evalState := eLoadWait
+    }.otherwise {
+      evalLoadInner := evalLoadInner + 1.U
     }
   }
 
-  val scratchA = io.e0Scratch.dout(A_WORD_W - 1, 0)
-  val scratchB = io.e0Scratch.dout(EVAL_PAIR_W - 1, A_WORD_W)
+  val evalPoint =
+    Mux(evalState === eEval0, evalPt0, evalPt1)
 
   for (lane <- 0 until 16; part <- 0 until 4) {
-    val highAWord =
-      if (part < 3) evalWindowA(part) else scratchA
-    val highBWord =
-      if (part < 3) evalWindowB(part) else scratchB
-    val highA =
-      highAWord((lane + 1) * A_EVAL_W - 1, lane * A_EVAL_W)
-    val highB =
-      highBWord((lane + 1) * B_EVAL_W - 1, lane * B_EVAL_W)
+    val midAWord = evalMid(part)(A_E0_WORD_W - 1, 0)
+    val midBWord = evalMid(part)(E0_PAIR_W - 1, A_E0_WORD_W)
+    val rawAValue =
+      evalRawA(evalInner)(part)((lane + 1) * 24 - 1, lane * 24)
+    val rawBValue =
+      evalRawB(evalInner)(part)((lane + 1) * 8 - 1, lane * 8)
+    val midAValue =
+      midAWord((lane + 1) * A_E0_W - 1, lane * A_E0_W)
+    val midBValue =
+      midBWord((lane + 1) * B_E0_W - 1, lane * B_E0_W)
 
-    sharedEvalA(lane).io.in(part) :=
-      Mux(e0ReadValid, inf.aMem(part).dout(lane), highA)
-    sharedEvalB(lane).io.in(part) :=
-      Mux(e0ReadValid, inf.bMem(part).dout(lane), highB)
+    sharedEvalA(lane).io.r(part) := Mux(
+      evalState === eEval0,
+      Cat(0.U((A_E1_W - 24).W), rawAValue),
+      Cat(Fill(A_E1_W - A_E0_W, midAValue(A_E0_W - 1)), midAValue)
+    )
+    sharedEvalB(lane).io.r(part) := Mux(
+      evalState === eEval0,
+      Cat(0.U((B_E1_W - 8).W), rawBValue),
+      Cat(Fill(B_E1_W - B_E0_W, midBValue(B_E0_W - 1)), midBValue)
+    )
+    sharedEvalA(lane).io.pt := evalPoint
+    sharedEvalB(lane).io.pt := evalPoint
   }
 
-  val evalPairOut = Wire(Vec(7, UInt(EVAL_PAIR_W.W)))
-  for (point <- 0 until 7) {
-    val aWord =
-      pack16((0 until 16).map(lane => sharedEvalA(lane).io.out(point)))
-    val bWord =
-      pack16((0 until 16).map(lane => sharedEvalB(lane).io.out(point)))
-    evalPairOut(point) := Cat(bWord, aWord)
-  }
-
-  when(e0ReadValid) {
-    for (point <- 0 until 7) {
-      evalPending(point) := evalPairOut(point)
+  val evalE0PairOut = Cat(
+    pack16((0 until 16).map(lane =>
+      sharedEvalB(lane).io.out(B_E0_W - 1, 0)
+    )),
+    pack16((0 until 16).map(lane =>
+      sharedEvalA(lane).io.out(A_E0_W - 1, 0)
+    ))
+  )
+  val evalE1BasePairOut = Cat(
+    pack16((0 until 16).map(lane =>
+      sharedEvalB(lane).io.out(B_E1_BASE_W - 1, 0)
+    )),
+    pack16((0 until 16).map(lane =>
+      sharedEvalA(lane).io.out(A_E1_BASE_W - 1, 0)
+    ))
+  )
+  val evalE1ExtOut = pack16((0 until 16).map { lane =>
+    Cat(
+      sharedEvalB(lane).io.out(B_E1_W - 1, B_E1_BASE_W),
+      sharedEvalA(lane).io.out(A_E1_W - 1, A_E1_BASE_W)
+    )
+  })
+  require(E1_EXT_WORD_W == 160)
+  when(evalReadValid) {
+    for (bank <- 0 until 4) {
+      evalRawA(evalReadInnerD)(bank) :=
+        pack16((0 until 16).map(lane => inf.aMem(bank).dout(lane)))
+      evalRawB(evalReadInnerD)(bank) :=
+        pack16((0 until 16).map(lane => inf.bMem(bank).dout(lane)))
     }
-    when(evalState === e0Wait) {
-      e0WritePoint := 0.U
-      evalState := e0Write
+    when(evalState === eLoadWait && evalReadInnerD === 3.U) {
+      evalInner := 0.U
+      evalPt0 := 0.U
+      evalPt1 := 0.U
+      evalState := eEval0
     }
-    when(e0ReadOuterD === 3.U && e0ReadInnerD === 3.U) {
+    when(evalReadOuterD === 3.U && evalReadInnerD === 3.U) {
       inputFull := false.B
     }
   }
 
-  when(evalState === e0Write) {
-    io.e0Scratch.en := true.B
-    io.e0Scratch.we := true.B
-    io.e0Scratch.addr := e0WritePoint * 4.U + e0Inner
-    io.e0Scratch.din := evalPending(e0WritePoint)
-
-    when(e0WritePoint === 6.U) {
-      when(e0ReadValid) {
-        e0Inner := e0ReadInnerD
-        e0WritePoint := 0.U
-      }.otherwise {
-        e1Pt0 := 0.U
-        e1PrimePart := 0.U
-        evalState := e1Prime
-      }
+  when(evalState === eEval0) {
+    evalMid(evalInner) := evalE0PairOut
+    when(evalInner === 3.U) {
+      evalInner := 0.U
+      evalPt1 := 0.U
+      evalState := eEval1
     }.otherwise {
-      e0WritePoint := e0WritePoint + 1.U
+      evalInner := evalInner + 1.U
     }
   }
 
-  when(e1ReadValid && e1ReadPartD =/= 3.U) {
-    evalWindowA(e1ReadPartD) := scratchA
-    evalWindowB(e1ReadPartD) := scratchB
-  }
-
-  when(e1ReadValid && e1ReadPartD === 3.U) {
-    for (point <- 0 until 7) {
-      evalPending(point) := evalPairOut(point)
-    }
-    when(evalState === e1PrimeWait) {
-      e1Pt0 := e1ReadPt0D
-      e1WritePoint := 0.U
-      evalState := e1Write
-    }
-  }
-
-  when(evalState === e1Write) {
+  when(evalState === eEval1) {
     for (slot <- 0 until 2) {
       when(evalOutSlot === slot.U) {
         io.e1Store(slot).en := true.B
         io.e1Store(slot).we := true.B
-        io.e1Store(slot).addr :=
-          e1WritePoint * 28.U + e1Pt0 * 4.U + evalOuter
-        io.e1Store(slot).din := evalPending(e1WritePoint)
+        io.e1Store(slot).addr := evalE1Addr
+        io.e1Store(slot).din := evalE1BasePairOut
+        when(e1NeedsExtension(evalPt0, evalPt1)) {
+          assert(evalE1ExtAddr < 148.U, "E1 extension write address overflow")
+          io.e1ExtStore(slot).en := true.B
+          io.e1ExtStore(slot).we := true.B
+          io.e1ExtStore(slot).addr := evalE1ExtAddr
+          io.e1ExtStore(slot).din := evalE1ExtOut
+        }
       }
     }
-
-    when(e1WritePoint === 6.U) {
-      when(e1Pt0 =/= 6.U) {
-        assert(
-          e1ReadValid && e1ReadPartD === 3.U,
-          "E1 prefetch did not finish before output drain"
-        )
-        e1Pt0 := e1Pt0 + 1.U
-        e1WritePoint := 0.U
+    when(e1NeedsExtension(evalPt0, evalPt1)) {
+      evalE1ExtAddr := evalE1ExtAddr + 4.U
+    }
+    when(evalPt1 === 6.U) {
+      evalPt1 := 0.U
+      when(evalPt0 =/= 6.U) {
+        evalE1Addr := evalE1Addr - 164.U
+        evalPt0 := evalPt0 + 1.U
+        evalInner := 0.U
+        evalState := eEval0
       }.otherwise {
         when(evalOuter === 3.U) {
           e1State(evalOutSlot) := memReady
           evalState := eIdle
         }.otherwise {
+          evalE1Addr := evalOuter + 1.U
+          evalE1ExtAddr := evalOuter + 1.U
           evalOuter := evalOuter + 1.U
-          e0Inner := 0.U
-          evalState := e0Issue
+          evalLoadInner := 0.U
+          evalPt0 := 0.U
+          evalState := eLoad
         }
       }
     }.otherwise {
-      e1WritePoint := e1WritePoint + 1.U
+      evalE1Addr := evalE1Addr + 28.U
+      evalPt1 := evalPt1 + 1.U
     }
   }
 
@@ -382,9 +392,13 @@ class ToomCook1024Core(
     e1State(evalWritePtr) := memWriting
     evalWritePtr := ~evalWritePtr
     evalOuter := 0.U
-    e0Inner := 0.U
-    e0WritePoint := 0.U
-    evalState := e0Issue
+    evalLoadInner := 0.U
+    evalInner := 0.U
+    evalPt0 := 0.U
+    evalPt1 := 0.U
+    evalE1Addr := 0.U
+    evalE1ExtAddr := 0.U
+    evalState := eLoad
   }
 
   // ------------------------------------------------------------------------
@@ -399,13 +413,13 @@ class ToomCook1024Core(
     cWidth = coreOutWidth
   ))
 
-  val coreInput = Reg(Vec(2, Vec(4, UInt(EVAL_PAIR_W.W))))
+  val coreInput = Reg(Vec(2, Vec(4, UInt(E1_PAIR_W.W))))
   val coreCurSel = RegInit(false.B)
 
   val pointEvalA =
-    Seq.fill(16)(Module(new EvalPoint(A_EVAL_W, A_EVAL_W)))
+    Seq.fill(16)(Module(new EvalPoint(A_E2_W, A_E2_W)))
   val pointEvalB =
-    Seq.fill(16)(Module(new EvalPoint(B_EVAL_W, B_EVAL_W)))
+    Seq.fill(16)(Module(new EvalPoint(B_E2_W, B_E2_W)))
 
   val cIdle :: cPrime :: cPrimeWait :: cRun :: Nil = Enum(4)
   val coreState = RegInit(cIdle)
@@ -420,6 +434,8 @@ class ToomCook1024Core(
   val coreChainValid = RegInit(false.B)
   val coreChainInSlot = RegInit(false.B)
   val coreChainOutSlot = RegInit(false.B)
+  val coreE1Addr = RegInit(0.U(8.W))
+  val coreE1ExtAddr = RegInit(0.U(8.W))
 
   val corePrimeRead = coreState === cPrime
   val corePrefetchRead =
@@ -429,28 +445,31 @@ class ToomCook1024Core(
 
   val coreReadPart = Wire(UInt(2.W))
   val coreReadSlot = Wire(Bool())
-  val coreReadAddr = Wire(UInt(8.W))
   val coreReadCaptureSel = Wire(Bool())
+  val coreReadNeedsExt = Wire(Bool())
+  val coreReadPt1 = Wire(UInt(3.W))
 
   coreReadPart := corePrimePart
   coreReadSlot := coreInSlot
-  coreReadAddr := corePrimePart
   coreReadCaptureSel := false.B
+  coreReadNeedsExt := false.B
+  coreReadPt1 := 0.U
 
   when(corePrefetchRead) {
     coreReadPart := corePt2 - 1.U
     coreReadCaptureSel := !coreCurSel
     when(coreGroup === 48.U) {
       coreReadSlot := coreChainInSlot
-      coreReadAddr := corePt2 - 1.U
+      coreReadNeedsExt := false.B
+      coreReadPt1 := 0.U
     }.otherwise {
       val nextPt0 =
         Mux(corePt1 === 6.U, corePt0 + 1.U, corePt0)
       val nextPt1 =
         Mux(corePt1 === 6.U, 0.U, corePt1 + 1.U)
       coreReadSlot := coreInSlot
-      coreReadAddr :=
-        nextPt1 * 28.U + nextPt0 * 4.U + (corePt2 - 1.U)
+      coreReadNeedsExt := e1NeedsExtension(nextPt0, nextPt1)
+      coreReadPt1 := nextPt1
     }
   }
 
@@ -458,8 +477,29 @@ class ToomCook1024Core(
     for (slot <- 0 until 2) {
       when(coreReadSlot === slot.U) {
         io.e1Store(slot).en := true.B
-        io.e1Store(slot).addr := coreReadAddr
+        io.e1Store(slot).addr := coreE1Addr
+        when(coreReadNeedsExt) {
+          assert(coreE1ExtAddr < 148.U, "E1 extension read address overflow")
+          io.e1ExtStore(slot).en := true.B
+          io.e1ExtStore(slot).addr := coreE1ExtAddr
+        }
       }
+    }
+    when(coreReadPart === 3.U) {
+      when(coreReadPt1 === 6.U) {
+        // End of a pt1 sweep:
+        //   (pt1=6, outer=3) -> (next pt0, pt1=0, outer=0)
+        coreE1Addr := coreE1Addr - 167.U
+      }.otherwise {
+        // The next logical group advances pt1.  Physical E1 rows are
+        // transposed, so its outer=0 address is 25 after the current outer=3.
+        coreE1Addr := coreE1Addr + 25.U
+      }
+    }.otherwise {
+      coreE1Addr := coreE1Addr + 1.U
+    }
+    when(coreReadNeedsExt) {
+      coreE1ExtAddr := coreE1ExtAddr + 1.U
     }
     when(corePrimeRead) {
       when(corePrimePart === 3.U) {
@@ -475,12 +515,47 @@ class ToomCook1024Core(
   val coreReadSlotD = RegEnable(coreReadSlot, coreE1ReadFire)
   val coreReadCaptureSelD =
     RegEnable(coreReadCaptureSel, coreE1ReadFire)
+  val coreReadNeedsExtD =
+    RegEnable(coreReadNeedsExt, coreE1ReadFire)
 
-  val coreReadWord = Mux(
+  val coreReadBaseWord = Mux(
     coreReadSlotD,
     io.e1Store(1).dout,
     io.e1Store(0).dout
   )
+  val coreReadExtWord = Mux(
+    coreReadSlotD,
+    io.e1ExtStore(1).dout,
+    io.e1ExtStore(0).dout
+  )
+  val coreReadBaseA =
+    coreReadBaseWord(A_E1_BASE_WORD_W - 1, 0)
+  val coreReadBaseB =
+    coreReadBaseWord(E1_BASE_PAIR_W - 1, A_E1_BASE_WORD_W)
+  val coreReadA = Wire(Vec(16, UInt(A_E1_W.W)))
+  val coreReadB = Wire(Vec(16, UInt(B_E1_W.W)))
+  for (lane <- 0 until 16) {
+    val baseA =
+      coreReadBaseA((lane + 1) * A_E1_BASE_W - 1, lane * A_E1_BASE_W)
+    val baseB =
+      coreReadBaseB((lane + 1) * B_E1_BASE_W - 1, lane * B_E1_BASE_W)
+    val ext =
+      coreReadExtWord((lane + 1) * E1_EXT_LANE_W - 1, lane * E1_EXT_LANE_W)
+    coreReadA(lane) := Mux(
+      coreReadNeedsExtD,
+      Cat(ext(A_E1_W - A_E1_BASE_W - 1, 0), baseA),
+      Cat(Fill(A_E1_W - A_E1_BASE_W, baseA(A_E1_BASE_W - 1)), baseA)
+    )
+    coreReadB(lane) := Mux(
+      coreReadNeedsExtD,
+      Cat(
+        ext(E1_EXT_LANE_W - 1, A_E1_W - A_E1_BASE_W),
+        baseB
+      ),
+      Cat(Fill(B_E1_W - B_E1_BASE_W, baseB(B_E1_BASE_W - 1)), baseB)
+    )
+  }
+  val coreReadWord = Cat(pack16(coreReadB), pack16(coreReadA))
 
   when(coreE1ReadValid) {
     coreInput(coreReadCaptureSelD)(coreReadPartD) := coreReadWord
@@ -501,17 +576,27 @@ class ToomCook1024Core(
         coreInput(1)(part),
         coreInput(0)(part)
       )
-      val aWord = pair(A_WORD_W - 1, 0)
-      val bWord = pair(EVAL_PAIR_W - 1, A_WORD_W)
+      val aWord = pair(A_E1_WORD_W - 1, 0)
+      val bWord = pair(E1_PAIR_W - 1, A_E1_WORD_W)
+      val aStored =
+        aWord((lane + 1) * A_E1_W - 1, lane * A_E1_W)
+      val bStored =
+        bWord((lane + 1) * B_E1_W - 1, lane * B_E1_W)
       pointEvalA(lane).io.r(part) :=
-        aWord((lane + 1) * A_EVAL_W - 1, lane * A_EVAL_W)
+        Cat(Fill(A_E2_W - A_E1_W, aStored(A_E1_W - 1)), aStored)
       pointEvalB(lane).io.r(part) :=
-        bWord((lane + 1) * B_EVAL_W - 1, lane * B_EVAL_W)
+        Cat(Fill(B_E2_W - B_E1_W, bStored(B_E1_W - 1)), bStored)
     }
     pointEvalA(lane).io.pt := corePt2
     pointEvalB(lane).io.pt := corePt2
-    core.io.a(lane) := pointEvalA(lane).io.out
-    core.io.b(lane) := pointEvalB(lane).io.out
+    core.io.a(lane) := Cat(
+      Fill(A_EVAL_W - A_E2_W, pointEvalA(lane).io.out(A_E2_W - 1)),
+      pointEvalA(lane).io.out
+    )
+    core.io.b(lane) := Cat(
+      Fill(B_EVAL_W - B_E2_W, pointEvalB(lane).io.out(B_E2_W - 1)),
+      pointEvalB(lane).io.out
+    )
   }
 
   val coreInputValid = coreState === cRun
@@ -525,6 +610,8 @@ class ToomCook1024Core(
     coreChainValid := true.B
     coreChainInSlot := coreReadPtr
     coreChainOutSlot := coreWritePtr
+    coreE1Addr := 0.U
+    coreE1ExtAddr := 0.U
     e1State(coreReadPtr) := memReading
     i0State(coreWritePtr) := memWriting
     coreReadPtr := ~coreReadPtr
@@ -575,6 +662,8 @@ class ToomCook1024Core(
     coreWritePtr := ~coreWritePtr
     corePrimePart := 0.U
     coreChainValid := false.B
+    coreE1Addr := 0.U
+    coreE1ExtAddr := 0.U
     coreState := cPrime
   }
 
@@ -583,8 +672,10 @@ class ToomCook1024Core(
   val coreMetaGroup = ShiftRegister(coreGroup, 4)
   val coreMetaPoint = ShiftRegister(corePt2, 4)
   val coreMetaSlot = ShiftRegister(coreOutSlot, 4)
-  val coreOutWord =
-    pack16((0 until 16).map(index => core.io.c(index)))
+  val coreInterpWord =
+    pack16((0 until 16).map(index =>
+      core.io.c(index)(CORE_INTERP_W - 1, 0)
+    ))
 
   when(core.io.valid_out || coreMetaValid) {
     assert(
@@ -593,90 +684,85 @@ class ToomCook1024Core(
     )
   }
 
-  val coreResultSet = Reg(Vec(6, UInt(CORE_WORD_W.W)))
-  when(core.io.valid_out && coreMetaValid && coreMetaPoint =/= 6.U) {
-    coreResultSet(coreMetaPoint) := coreOutWord
+  val interpCore = Module(new Interp4ColsCoreEngine)
+  val coreInterpStart =
+    core.io.valid_out && coreMetaValid && coreMetaPoint === 6.U
+  interpCore.io.inValid := core.io.valid_out && coreMetaValid
+  interpCore.io.inPoint := coreMetaPoint
+  for (lane <- 0 until 16) {
+    interpCore.io.inWord(lane) :=
+      coreInterpWord((lane + 1) * CORE_INTERP_W - 1, lane * CORE_INTERP_W)
   }
 
-  val interpCore = Module(new Interp16ColsShared)
-  interpCore.io.mode := 0.U
-  interpCore.io.pr0 := 0.U
-  interpCore.io.pr1 := 0.U
-  interpCore.io.pr2 := 0.U
-  for (point <- 0 until 7; lane <- 0 until 16) {
-    val word =
-      if (point < 6) coreResultSet(point) else coreOutWord
-    interpCore.io.in(point * 16 + lane) :=
-      word((lane + 1) * coreOutWidth - 1, lane * coreOutWidth)
+  val i0EngineGroup = Reg(UInt(6.W))
+  val i0EngineSlot = Reg(Bool())
+  val i0FirstWord = Reg(UInt(I0_WORD_W.W))
+  val i0PatchWord = Reg(UInt(I0_WORD_W.W))
+  val i0PatchValid = RegInit(false.B)
+
+  when(coreInterpStart) {
+    assert(!interpCore.io.busy, "I0 interpolation engine overlap")
+    i0EngineGroup := coreMetaGroup
+    i0EngineSlot := coreMetaSlot
   }
 
-  private def interpChunk(
-      out: Vec[UInt],
-      chunk: Int,
-      width: Int
-  ): UInt = {
-    pack16((0 until 16).map { lane =>
-      out(chunk * 16 + lane)(width - 1, 0)
-    })
-  }
+  val i0EngineWord = pack16((0 until 16).map { index =>
+    interpCore.io.out(index)
+  })
 
-  val i0Raw = Wire(Vec(4, UInt(I0_WORD_W.W)))
-  for (chunk <- 0 until 4) {
-    i0Raw(chunk) := interpChunk(interpCore.io.out, chunk, 33)
-  }
-  val i0First = split16(i0Raw(0), 33)
-  val i0Corrected = Wire(Vec(16, UInt(33.W)))
-  i0Corrected := i0First
-  i0Corrected(0) :=
-    ParaMath.mask(i0First(0) - interpCore.io.nr2, 33)
-  i0Corrected(1) :=
-    ParaMath.mask(i0First(1) - interpCore.io.nr1, 33)
-  i0Corrected(2) :=
-    ParaMath.mask(i0First(2) - interpCore.io.nr0, 33)
-
-  val i0Pending = Reg(Vec(4, UInt(I0_WORD_W.W)))
-  val i0PendingGroup = Reg(UInt(6.W))
-  val i0PendingSlot = Reg(Bool())
-  val i0WriteValid = RegInit(false.B)
-  val i0WriteIndex = RegInit(0.U(2.W))
-
-  when(core.io.valid_out && coreMetaValid && coreMetaPoint === 6.U) {
-    i0Pending(0) := pack16(i0Corrected)
-    for (chunk <- 1 until 4) {
-      i0Pending(chunk) := i0Raw(chunk)
+  when(interpCore.io.outValid) {
+    when(interpCore.io.outChunk === 0.U) {
+      i0FirstWord := i0EngineWord
+    }.otherwise {
+      for (slot <- 0 until 2) {
+        when(i0EngineSlot === slot.U) {
+          io.i0Store(slot).en := true.B
+          io.i0Store(slot).we := true.B
+          io.i0Store(slot).addr :=
+            Cat(i0EngineGroup, interpCore.io.outChunk)
+          io.i0Store(slot).din := i0EngineWord
+        }
+      }
     }
-    i0PendingGroup := coreMetaGroup
-    i0PendingSlot := coreMetaSlot
-    i0WriteValid := true.B
-    i0WriteIndex := 0.U
+
+    when(interpCore.io.done) {
+      val first = split16(i0FirstWord, I0_W)
+      val corrected = Wire(Vec(16, UInt(I0_W.W)))
+      corrected := first
+      corrected(0) :=
+        ParaMath.mask(first(0) - interpCore.io.nr2, I0_W)
+      corrected(1) :=
+        ParaMath.mask(first(1) - interpCore.io.nr1, I0_W)
+      corrected(2) :=
+        ParaMath.mask(first(2) - interpCore.io.nr0, I0_W)
+      i0PatchWord := pack16(corrected)
+      i0PatchValid := true.B
+    }
   }
 
-  when(i0WriteValid) {
+  when(i0PatchValid) {
     for (slot <- 0 until 2) {
-      when(i0PendingSlot === slot.U) {
+      when(i0EngineSlot === slot.U) {
         io.i0Store(slot).en := true.B
         io.i0Store(slot).we := true.B
-        io.i0Store(slot).addr :=
-          i0PendingGroup * 4.U + i0WriteIndex
-        io.i0Store(slot).din := i0Pending(i0WriteIndex)
+        io.i0Store(slot).addr := Cat(i0EngineGroup, 0.U(2.W))
+        io.i0Store(slot).din := i0PatchWord
       }
     }
-    when(i0WriteIndex === 3.U) {
-      i0WriteValid := false.B
-      when(i0PendingGroup === 48.U) {
-        i0State(i0PendingSlot) := memReady
-      }
-    }.otherwise {
-      i0WriteIndex := i0WriteIndex + 1.U
+    i0PatchValid := false.B
+    when(i0EngineGroup === 48.U) {
+      i0State(i0EngineSlot) := memReady
     }
   }
 
   // ------------------------------------------------------------------------
   // Inte slot: sequentially gather seven point words, then execute I1/I2.
   // ------------------------------------------------------------------------
-  val interpInte = Module(new Interp16ColsShared)
-  interpInte.io.mode := 1.U
-  interpInte.io.in := VecInit(Seq.fill(7 * 16)(0.U(36.W)))
+  val interpInte = Module(new Interp4ColsInteEngine)
+  interpInte.io.inValid := false.B
+  interpInte.io.inPoint := 0.U
+  interpInte.io.inWord := VecInit(Seq.fill(16)(0.U(I0_W.W)))
+  interpInte.io.modeI2 := false.B
   interpInte.io.pr0 := 0.U
   interpInte.io.pr1 := 0.U
   interpInte.io.pr2 := 0.U
@@ -689,11 +775,17 @@ class ToomCook1024Core(
   val i1IssueChunk = RegInit(0.U(2.W))
   val i1IssuePoint = RegInit(0.U(3.W))
   val i1IssueDone = RegInit(false.B)
-  val i1Gather = Reg(Vec(6, UInt(I0_WORD_W.W)))
-  val i1Carry0 = RegInit(0.U(27.W))
-  val i1Carry1 = RegInit(0.U(27.W))
-  val i1Carry2 = RegInit(0.U(27.W))
-  val i1FirstWord = Reg(UInt(I1_WORD_W.W))
+  val i1ReadAddr = RegInit(0.U(8.W))
+  val i1WriteAddr = RegInit(0.U(7.W))
+  val inteCarry0 = RegInit(0.U(I1_W.W))
+  val inteCarry1 = RegInit(0.U(I1_W.W))
+  val inteCarry2 = RegInit(0.U(I1_W.W))
+  val inteFirstWord = Reg(UInt(I1_WORD_W.W))
+  val i1EngineP0 = Reg(UInt(3.W))
+  val i1EngineChunk = Reg(UInt(2.W))
+  val intePatchWord = Reg(UInt(I1_WORD_W.W))
+  val i1PatchValid = RegInit(false.B)
+  val inteEngineIsI2 = RegInit(false.B)
 
   val i1ReadFire = inteState === iI1 && !i1IssueDone
   val i1ReadValid = RegNext(i1ReadFire, false.B)
@@ -702,18 +794,17 @@ class ToomCook1024Core(
   val i1ReadPointD = RegEnable(i1IssuePoint, i1ReadFire)
 
   when(i1ReadFire) {
-    val readAddr =
-      (i1IssueP0 * 7.U + i1IssuePoint) * 4.U + i1IssueChunk
     for (slot <- 0 until 2) {
       when(inteInSlot === slot.U) {
         io.i0Store(slot).en := true.B
-        io.i0Store(slot).addr := readAddr
+        io.i0Store(slot).addr := i1ReadAddr
       }
     }
 
     when(i1IssuePoint === 6.U) {
       i1IssuePoint := 0.U
       when(i1IssueChunk === 3.U) {
+        i1ReadAddr := i1ReadAddr + 1.U
         i1IssueChunk := 0.U
         when(i1IssueP0 === 6.U) {
           i1IssueDone := true.B
@@ -721,9 +812,11 @@ class ToomCook1024Core(
           i1IssueP0 := i1IssueP0 + 1.U
         }
       }.otherwise {
+        i1ReadAddr := i1ReadAddr - 23.U
         i1IssueChunk := i1IssueChunk + 1.U
       }
     }.otherwise {
+      i1ReadAddr := i1ReadAddr + 4.U
       i1IssuePoint := i1IssuePoint + 1.U
     }
   }
@@ -733,109 +826,94 @@ class ToomCook1024Core(
     io.i0Store(1).dout,
     io.i0Store(0).dout
   )
-  when(i1ReadValid && i1ReadPointD =/= 6.U) {
-    i1Gather(i1ReadPointD) := i1ReadWord
-  }
 
   when(inteState === iI1) {
-    interpInte.io.mode := 1.U
+    interpInte.io.modeI2 := false.B
     interpInte.io.pr0 :=
-      Mux(i1ReadChunkD === 0.U, 0.U, i1Carry0)
+      Mux(i1ReadChunkD === 0.U, 0.U, inteCarry0)
     interpInte.io.pr1 :=
-      Mux(i1ReadChunkD === 0.U, 0.U, i1Carry1)
+      Mux(i1ReadChunkD === 0.U, 0.U, inteCarry1)
     interpInte.io.pr2 :=
-      Mux(i1ReadChunkD === 0.U, 0.U, i1Carry2)
-    for (point <- 0 until 7; lane <- 0 until 16) {
-      val word =
-        if (point < 6) i1Gather(point) else i1ReadWord
-      interpInte.io.in(point * 16 + lane) :=
-        word((lane + 1) * 33 - 1, lane * 33)
+      Mux(i1ReadChunkD === 0.U, 0.U, inteCarry2)
+    when(i1ReadValid) {
+      interpInte.io.inValid := true.B
+      interpInte.io.inPoint := i1ReadPointD
+      for (lane <- 0 until 16) {
+        interpInte.io.inWord(lane) :=
+          i1ReadWord((lane + 1) * I0_W - 1, lane * I0_W)
+      }
     }
   }
-
-  val i1Raw = Wire(Vec(4, UInt(I1_WORD_W.W)))
-  for (chunk <- 0 until 4) {
-    i1Raw(chunk) := interpChunk(interpInte.io.out, chunk, 27)
-  }
-
-  val i1FirstVec = split16(i1FirstWord, 27)
-  val i1Corrected = Wire(Vec(16, UInt(27.W)))
-  i1Corrected := i1FirstVec
-  i1Corrected(0) :=
-    ParaMath.mask(i1FirstVec(0) - interpInte.io.nr2(26, 0), 27)
-  i1Corrected(1) :=
-    ParaMath.mask(i1FirstVec(1) - interpInte.io.nr1(26, 0), 27)
-  i1Corrected(2) :=
-    ParaMath.mask(i1FirstVec(2) - interpInte.io.nr0(26, 0), 27)
-
-  val i1Output = Reg(Vec(4, UInt(I1_WORD_W.W)))
-  val i1PatchWord = Reg(UInt(I1_WORD_W.W))
-  val i1OutputP0 = Reg(UInt(3.W))
-  val i1OutputChunk = Reg(UInt(2.W))
-  val i1OutputNeedsPatch = RegInit(false.B)
-  val i1WriteValid = RegInit(false.B)
-  val i1WriteIndex = RegInit(0.U(3.W))
 
   when(i1ReadValid && i1ReadPointD === 6.U) {
-    for (chunk <- 0 until 4) {
-      i1Output(chunk) := i1Raw(chunk)
-    }
-    i1OutputP0 := i1ReadP0D
-    i1OutputChunk := i1ReadChunkD
-    i1OutputNeedsPatch := i1ReadChunkD === 3.U
-    i1WriteValid := true.B
-    i1WriteIndex := 0.U
+    assert(!interpInte.io.busy, "I1 interpolation engine overlap")
+    inteEngineIsI2 := false.B
+    i1EngineP0 := i1ReadP0D
+    i1EngineChunk := i1ReadChunkD
+  }
 
-    i1Carry0 := interpInte.io.nr0(26, 0)
-    i1Carry1 := interpInte.io.nr1(26, 0)
-    i1Carry2 := interpInte.io.nr2(26, 0)
-    when(i1ReadChunkD === 0.U) {
-      i1FirstWord := i1Raw(0)
+  val i1EngineWord = pack16((0 until 16).map { index =>
+    interpInte.io.out(index)(26, 0)
+  })
+
+  when(interpInte.io.outValid && !inteEngineIsI2) {
+    io.i1Store.en := true.B
+    io.i1Store.we := true.B
+    io.i1Store.addr := i1WriteAddr
+    io.i1Store.din := i1EngineWord
+    i1WriteAddr := i1WriteAddr + 1.U
+
+    when(i1EngineChunk === 0.U && interpInte.io.outChunk === 0.U) {
+      inteFirstWord := i1EngineWord
     }
-    when(i1ReadChunkD === 3.U) {
-      i1PatchWord := pack16(i1Corrected)
-    }
-    when(i1ReadP0D === 6.U && i1ReadChunkD === 3.U) {
-      i0State(inteInSlot) := memEmpty
+
+    when(interpInte.io.done) {
+      inteCarry0 := interpInte.io.nr0
+      inteCarry1 := interpInte.io.nr1
+      inteCarry2 := interpInte.io.nr2
+
+      when(i1EngineChunk === 3.U) {
+        val first = split16(inteFirstWord, I1_W)
+        val corrected = Wire(Vec(16, UInt(I1_W.W)))
+        corrected := first
+        corrected(0) :=
+          ParaMath.mask(first(0) - interpInte.io.nr2, I1_W)
+        corrected(1) :=
+          ParaMath.mask(first(1) - interpInte.io.nr1, I1_W)
+        corrected(2) :=
+          ParaMath.mask(first(2) - interpInte.io.nr0, I1_W)
+        intePatchWord := pack16(corrected)
+        i1PatchValid := true.B
+        when(i1EngineP0 === 6.U) {
+          i0State(inteInSlot) := memEmpty
+        }
+      }
     }
   }
 
-  when(i1WriteValid) {
+  when(i1PatchValid) {
+    assert(
+      !(interpInte.io.outValid && !inteEngineIsI2),
+      "I1 SRAM patch conflicts with interpolation output"
+    )
     io.i1Store.en := true.B
     io.i1Store.we := true.B
-    when(i1WriteIndex < 4.U) {
-      io.i1Store.addr :=
-        i1OutputP0 * 16.U +
-          i1OutputChunk * 4.U + i1WriteIndex
-      io.i1Store.din := i1Output(i1WriteIndex)
-      when(i1WriteIndex === 3.U) {
-        when(i1OutputNeedsPatch) {
-          i1WriteIndex := 4.U
-        }.otherwise {
-          i1WriteValid := false.B
-        }
-      }.otherwise {
-        i1WriteIndex := i1WriteIndex + 1.U
-      }
-    }.otherwise {
-      io.i1Store.addr := i1OutputP0 * 16.U
-      io.i1Store.din := i1PatchWord
-      i1WriteValid := false.B
-      when(i1OutputP0 === 6.U) {
-        inteState := iI2
-      }
+    io.i1Store.addr := Cat(i1EngineP0, 0.U(4.W))
+    io.i1Store.din := intePatchWord
+    i1PatchValid := false.B
+    when(i1EngineP0 === 6.U) {
+      inteCarry0 := 0.U
+      inteCarry1 := 0.U
+      inteCarry2 := 0.U
+      inteState := iI2
     }
   }
 
   val i2IssueChunk = RegInit(0.U(4.W))
   val i2IssuePoint = RegInit(0.U(3.W))
   val i2IssueDone = RegInit(false.B)
-  val i2Gather = Reg(Vec(6, UInt(I1_WORD_W.W)))
-  val i2Carry0 = RegInit(0.U(24.W))
-  val i2Carry1 = RegInit(0.U(24.W))
-  val i2Carry2 = RegInit(0.U(24.W))
-  val i2FirstWord = Reg(UInt((16 * 24).W))
-  val i2PatchWord = Reg(UInt((16 * 24).W))
+  val i2EngineChunk = Reg(UInt(4.W))
+  val i2ReadAddr = RegInit(0.U(7.W))
 
   val i2ReadFire = inteState === iI2 && !i2IssueDone
   val i2ReadValid = RegNext(i2ReadFire, false.B)
@@ -844,73 +922,89 @@ class ToomCook1024Core(
 
   when(i2ReadFire) {
     io.i1Store.en := true.B
-    io.i1Store.addr := i2IssuePoint * 16.U + i2IssueChunk
+    io.i1Store.addr := i2ReadAddr
     when(i2IssuePoint === 6.U) {
       i2IssuePoint := 0.U
       when(i2IssueChunk === 15.U) {
         i2IssueDone := true.B
       }.otherwise {
+        i2ReadAddr := i2ReadAddr - 95.U
         i2IssueChunk := i2IssueChunk + 1.U
       }
     }.otherwise {
+      i2ReadAddr := i2ReadAddr + 16.U
       i2IssuePoint := i2IssuePoint + 1.U
     }
   }
 
-  when(i2ReadValid && i2ReadPointD =/= 6.U) {
-    i2Gather(i2ReadPointD) := io.i1Store.dout
-  }
-
   when(inteState === iI2 || inteState === iI2Patch) {
-    interpInte.io.mode := 2.U
-    interpInte.io.pr0 := i2Carry0
-    interpInte.io.pr1 := i2Carry1
-    interpInte.io.pr2 := i2Carry2
-    for (point <- 0 until 7; lane <- 0 until 16) {
-      val word =
-        if (point < 6) i2Gather(point) else io.i1Store.dout
-      interpInte.io.in(point * 16 + lane) :=
-        word((lane + 1) * 27 - 1, lane * 27)
+    interpInte.io.modeI2 := true.B
+    interpInte.io.pr0 := inteCarry0
+    interpInte.io.pr1 := inteCarry1
+    interpInte.io.pr2 := inteCarry2
+    when(i2ReadValid) {
+      interpInte.io.inValid := true.B
+      interpInte.io.inPoint := i2ReadPointD
+      for (lane <- 0 until 16) {
+        val value =
+          io.i1Store.dout((lane + 1) * I1_W - 1, lane * I1_W)
+        interpInte.io.inWord(lane) :=
+          Cat(0.U((I0_W - I1_W).W), value)
+      }
     }
-  }
-
-  val i2Raw = Wire(Vec(4, UInt((16 * 24).W)))
-  for (chunk <- 0 until 4) {
-    i2Raw(chunk) := interpChunk(interpInte.io.out, chunk, 24)
   }
 
   when(i2ReadValid && i2ReadPointD === 6.U) {
-    for (chunk <- 0 until 4) {
-      inf.cMem(chunk).we := true.B
-      inf.cMem(chunk).addr := i2ReadChunkD
-      inf.cMem(chunk).din := split16(i2Raw(chunk), 24)
-    }
-    when(i2ReadChunkD === 0.U) {
-      i2FirstWord := i2Raw(0)
-    }
-    i2Carry0 := interpInte.io.nr0(23, 0)
-    i2Carry1 := interpInte.io.nr1(23, 0)
-    i2Carry2 := interpInte.io.nr2(23, 0)
+    assert(!interpInte.io.busy, "I2 interpolation engine overlap")
+    inteEngineIsI2 := true.B
+    i2EngineChunk := i2ReadChunkD
+  }
 
-    when(i2ReadChunkD === 15.U) {
-      val first = split16(i2FirstWord, 24)
-      val corrected = Wire(Vec(16, UInt(24.W)))
-      corrected := first
-      corrected(0) :=
-        ParaMath.mask(first(0) - interpInte.io.nr2(23, 0), 24)
-      corrected(1) :=
-        ParaMath.mask(first(1) - interpInte.io.nr1(23, 0), 24)
-      corrected(2) :=
-        ParaMath.mask(first(2) - interpInte.io.nr0(23, 0), 24)
-      i2PatchWord := pack16(corrected)
-      inteState := iI2Patch
+  val i2EngineWord = pack16((0 until 16).map { index =>
+    interpInte.io.out(index)(23, 0)
+  })
+
+  when(interpInte.io.outValid && inteEngineIsI2) {
+    for (bank <- 0 until 4) {
+      when(interpInte.io.outChunk === bank.U) {
+        inf.cMem(bank).we := true.B
+        inf.cMem(bank).addr := i2EngineChunk
+        inf.cMem(bank).din := split16(i2EngineWord, 24)
+      }
+    }
+
+    when(i2EngineChunk === 0.U && interpInte.io.outChunk === 0.U) {
+      inteFirstWord :=
+        Cat(0.U((I1_WORD_W - I2_WORD_W).W), i2EngineWord)
+    }
+
+    when(interpInte.io.done) {
+      inteCarry0 := Cat(0.U((I1_W - I2_W).W), interpInte.io.nr0(23, 0))
+      inteCarry1 := Cat(0.U((I1_W - I2_W).W), interpInte.io.nr1(23, 0))
+      inteCarry2 := Cat(0.U((I1_W - I2_W).W), interpInte.io.nr2(23, 0))
+
+      when(i2EngineChunk === 15.U) {
+        val first = split16(inteFirstWord(I2_WORD_W - 1, 0), I2_W)
+        val corrected = Wire(Vec(16, UInt(I2_W.W)))
+        corrected := first
+        corrected(0) :=
+          ParaMath.mask(first(0) - interpInte.io.nr2(23, 0), I2_W)
+        corrected(1) :=
+          ParaMath.mask(first(1) - interpInte.io.nr1(23, 0), I2_W)
+        corrected(2) :=
+          ParaMath.mask(first(2) - interpInte.io.nr0(23, 0), I2_W)
+        intePatchWord :=
+          Cat(0.U((I1_WORD_W - I2_WORD_W).W), pack16(corrected))
+        inteState := iI2Patch
+      }
     }
   }
 
   when(inteState === iI2Patch) {
     inf.cMem(0).we := true.B
     inf.cMem(0).addr := 0.U
-    inf.cMem(0).din := split16(i2PatchWord, 24)
+    inf.cMem(0).din :=
+      split16(intePatchWord(I2_WORD_W - 1, 0), I2_W)
     doneReg := true.B
     inteState := iIdle
   }
@@ -928,18 +1022,17 @@ class ToomCook1024Core(
     i1IssueChunk := 0.U
     i1IssuePoint := 0.U
     i1IssueDone := false.B
-    i1Carry0 := 0.U
-    i1Carry1 := 0.U
-    i1Carry2 := 0.U
-    i1WriteValid := false.B
+    i1ReadAddr := 0.U
+    i1WriteAddr := 0.U
+    inteCarry0 := 0.U
+    inteCarry1 := 0.U
+    inteCarry2 := 0.U
+    i1PatchValid := false.B
 
     i2IssueChunk := 0.U
     i2IssuePoint := 0.U
     i2IssueDone := false.B
-    i2Carry0 := 0.U
-    i2Carry1 := 0.U
-    i2Carry2 := 0.U
-
+    i2ReadAddr := 0.U
     inteState := iI1
   }
 }
@@ -958,9 +1051,7 @@ class ToomCook1024(
 ) extends Module {
   val io = IO(new ToomCook1024ExternalIO)
 
-  private val aWordWidth = 16 * aEvalWidth
-  private val bWordWidth = 16 * bEvalWidth
-  private val evalPairWidth = aWordWidth + bWordWidth
+  private val e1BasePairWidth = 16 * (27 + 13)
   val arithmetic = Module(new ToomCook1024Core(
     t = t,
     k = k,
@@ -989,25 +1080,25 @@ class ToomCook1024(
     io.cMem(bank).din := arithmetic.io.inf.cMem(bank).din
   }
 
-  val e0Scratch =
-    Module(new EvalPairSpRam(
-      aWordWidth,
-      bWordWidth,
-      28,
-      useMemoryCompiler
-    ))
   val e1Store =
-    Seq.fill(2)(Module(new EvalPairSpRam(
-      aWordWidth,
-      bWordWidth,
+    Seq.fill(2)(Module(new StripedSpRam(
+      e1BasePairWidth,
       196,
+      160,
+      useMemoryCompiler
+    )))
+  val e1ExtStore =
+    Seq.fill(2)(Module(new StripedSpRam(
+      160,
+      148,
+      160,
       useMemoryCompiler
     )))
   val i0Store =
     Seq.fill(2)(Module(new StripedSpRam(
-      16 * 33,
+      16 * InterpStorageWidth.I0_W,
       196,
-      132,
+      160,
       useMemoryCompiler
     )))
   val i1Store =
@@ -1030,22 +1121,10 @@ class ToomCook1024(
     port.dout := ram.io.dout
   }
 
-  private def connectEvalPair(
-      ram: EvalPairSpRam,
-      port: ToomCookSpBufferRWIO
-  ): Unit = {
-    ram.io.clk := clock
-    ram.io.en := port.en
-    ram.io.we := port.we
-    ram.io.addr := port.addr
-    ram.io.din := port.din
-    port.dout := ram.io.dout
-  }
-
-  connectEvalPair(e0Scratch, arithmetic.io.e0Scratch)
   connect(i1Store, arithmetic.io.i1Store)
   for (slot <- 0 until 2) {
-    connectEvalPair(e1Store(slot), arithmetic.io.e1Store(slot))
+    connect(e1Store(slot), arithmetic.io.e1Store(slot))
+    connect(e1ExtStore(slot), arithmetic.io.e1ExtStore(slot))
     connect(i0Store(slot), arithmetic.io.i0Store(slot))
   }
 }
@@ -1127,13 +1206,29 @@ class ToomCook1024WithSram extends Module {
     }
   }
 
+  /*
+   * The four-column interpolation engine writes bank 0/address 0 once for the
+   * first raw chunk and once more for the final negacyclic correction.  Only
+   * the latter completes a result.  Bank 3/address 15 is the final raw word,
+   * so it arms the following bank 0/address 0 patch as the completion event.
+   */
+  val waitFinalPatch = RegInit(false.B)
+  when(
+    dut.io.cMem(3).we &&
+      dut.io.cMem(3).addr === 15.U
+  ) {
+    waitFinalPatch := true.B
+  }
   val resultComplete =
-    dut.io.cMem(0).we && !dut.io.cMem(1).we &&
+    waitFinalPatch &&
+      dut.io.cMem(0).we && !dut.io.cMem(1).we &&
+      !dut.io.cMem(2).we && !dut.io.cMem(3).we &&
       dut.io.cMem(0).addr === 0.U
   when(resultComplete) {
     assert(!outFull(outWriteSlot), "external output SRAM overflow")
     outFull(outWriteSlot) := true.B
     outWriteSlot := ~outWriteSlot
+    waitFinalPatch := false.B
   }
 
   val cReadFire = io.c_re && outFull(outReadSlot)
